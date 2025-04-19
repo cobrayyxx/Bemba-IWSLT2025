@@ -1,6 +1,8 @@
 import os
-cache_dir = "/content/huggingface_cache"
+cache_dir = "/workspace/huggingface_cache"
 os.makedirs(cache_dir, exist_ok=True)
+
+# pip install transformers datasets evaluate jiwer sacrebleu pandas tensorboard==1.14.0 'accelerate>=0.26.0' -q
 
 # Set ALL Hugging Face related cache directories
 os.environ["TRANSFORMERS_CACHE"] = os.path.join(cache_dir, "transformers")
@@ -23,19 +25,27 @@ for dir_path in [os.environ["TRANSFORMERS_CACHE"],
 from datasets import config
 config.HF_DATASETS_CACHE = os.environ["HF_DATASETS_CACHE"]
 
-
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from datasets import load_dataset, Dataset, Audio, DatasetDict, concatenate_datasets
 from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 import evaluate
 import pandas as pd
+
 from huggingface_hub import login
+
+login("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")
+
+
+from huggingface_hub import whoami
+
+# Get user info
+user_info = whoami()
+print(user_info)
+
 import os
-
 os.environ["WANDB_DISABLED"] = "true"
-login("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")
 
-model_name = "facebook/nllb-200-3.3B"
+model_name = "facebook/nllb-200-distilled-600M"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
 
@@ -58,21 +68,35 @@ df_train = df_train[~df_train["translation"].isna()]
 cleaned_train = Dataset.from_pandas(df_train)
 cleaned_test = Dataset.from_pandas(df_test)
 
-train_df = pd.read_csv("bt_tatoeba_en_bem_2.csv")
-train_dataset_augmented = Dataset.from_pandas(train_df)
-train_dataset_augmented = train_dataset_augmented.rename_column("text_en", "translation")
-train_dataset_augmented = train_dataset_augmented.rename_column("text_bem", "sentence")
-train_dataset_concat = concatenate_datasets([cleaned_train, train_dataset_augmented])
+# Additional dataset
+train_flores_dataset = load_dataset("kreasof-ai/flores200-en-bem", split="dev")
+train_flores = train_flores_dataset.to_pandas()
+# remove "id"
+train_flores.drop(columns=["id"], inplace=True)
 
+train_augmented = pd.read_csv("tatoeba_en_bem_filtered_20k_wout_bt.csv")
+train_augmented.drop(columns=["score"], inplace=True)
+train_merge = pd.concat([train_flores, train_augmented], ignore_index=True)
+df_duplicate = train_merge[train_merge.duplicated(subset=["text_bem"])]
+
+train_df_no_duplicate = train_merge.drop_duplicates(subset=["text_bem"], keep="first").reset_index(drop=True)
+train_df = train_df_no_duplicate
+
+train_merge = Dataset.from_pandas(train_merge)
+
+train_merge = train_merge.rename_column("text_en", "translation")
+train_merge =  train_merge.rename_column('text_bem', "sentence")
+
+train_dataset_concat = concatenate_datasets([cleaned_train, train_merge])
 df_train = train_dataset_concat.to_pandas()
-# shuffle the row
+
 df_train = df_train.sample(frac=1, random_state=42).reset_index(drop=True)
-# cleaned_train = Dataset.from_pandas(df_train.head(10)) # For testing purpose
+
 cleaned_train = Dataset.from_pandas(df_train)
 
+# Training
 metric_bleu = evaluate.load("sacrebleu")
 metric_chrf = evaluate.load("chrf")
-# metric_wer = evaluate.load("wer")
 
 def compute_metrics(pred):
     pred_ids = pred.predictions
@@ -95,6 +119,29 @@ def compute_metrics(pred):
 
     return {"bleu": bleu, "chrf": chrf}
 
+sentences = cleaned_train["sentence"][:5]
+
+# Set the language tokens
+tokenizer.src_lang = "bem_Latn"  # Source language: eng in Latin script
+tokenizer.tgt_lang = "eng_Latn"  # Target language: hin in Latin script
+
+# Tokenize and set source/target languages
+inputs = tokenizer(
+    sentences,
+    return_tensors="pt",
+    padding=True,
+    truncation=True
+)
+
+# Generate translations
+translated = model.generate(**inputs)
+translations = [tokenizer.decode(t, skip_special_tokens=True) for t in translated]
+
+# Print translations
+for i, translation in enumerate(translations):
+    print(f"Input: {sentences[i]}")
+    print(f"Translation: {translation}\n")
+
 def preprocess_function(dataset):
     # Tokenize the source text (English) and target text (Hindi)
     try:
@@ -114,7 +161,7 @@ test_tokenized = cleaned_test.map(preprocess_function, batched=True)
 
 # adjust the variable below
 hf_repo = "kreasof-ai"
-output_dir = "nllb-IWSLT2025-bem-en-dum"
+output_dir = "nllb-200-distilled-600M-bem2en-flores200"
 
 # Fine-tune
 # Define training arguments
@@ -122,15 +169,15 @@ training_args = Seq2SeqTrainingArguments(
     output_dir=output_dir,               # Directory to save checkpoints
     per_device_train_batch_size=8,      # Adjust batch size based on GPU memory
     gradient_accumulation_steps=1,
-    learning_rate=1e-4,                   # Learning rate
+    learning_rate=5e-5,                   # Learning rate
     warmup_ratio=0.03,
     num_train_epochs=3,                # Train for 100 epochs
-    gradient_checkpointing=True,
 
 
     fp16=True,
+    fp16_full_eval=True,
     hub_model_id=f"{hf_repo}/{output_dir}",  # Change this
-    evaluation_strategy="epoch",         # Evaluate at the end of each epoch
+    eval_strategy="epoch",         # Evaluate at the end of each epoch
 
     per_device_eval_batch_size=8,
     predict_with_generate=True,          # Generate predictions for validation
@@ -158,14 +205,13 @@ trainer = Seq2SeqTrainer(
     tokenizer=tokenizer,
 )
 
+import gc
+import torch
+
+gc.collect()
+
+torch.cuda.empty_cache()
+
 trainer.train()
-# trainer.train(resume_from_checkpoint=True)
-# trainer.train(resume_from_checkpoint="./nllb-600/checkpoint-1000") # resume from specific checkpoint
-# if os.path.exists(output_dir):
-#     trainer.train(resume_from_checkpoint=True)
-# else:
-#     trainer.train()
 
-
-# Push the final model to Hugging Face Hub
-trainer.push_to_hub()
+trainer.push_to_hub(commit_message="Finish training with original + Flores200 + filtered augmented data (no <bt> tag), lr=5e-5")
